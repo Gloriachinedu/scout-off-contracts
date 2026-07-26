@@ -36,18 +36,12 @@
 #   from the OLD contract and calls register_validator() on the NEW one,
 #   signed by DEPLOYER_SECRET.
 #
-#   PLAYERS and SCOUTS — CANNOT be auto-replayed. registration.register_player()
-#   and registration.register_scout() both call wallet.require_auth(), i.e.
-#   they require the PLAYER's / SCOUT's OWN signature — not the admin's. An
-#   operator does not hold those private keys and therefore cannot submit a
-#   valid registration transaction on their behalf. This script still EXPORTS
-#   all player and scout data to a JSON file so nothing is lost, but the actual
-#   re-seeding on the NEW contract must happen by one of:
-#     (a) each player / scout re-registering themselves against the new
-#         contract ID (self-service), or
-#     (b) the team adding a dedicated admin-only seeding entrypoint to the
-#         registration contract (e.g. admin_seed_player) — OUT OF SCOPE for
-#         this issue; tracked as a documented follow-up.
+#   PLAYERS and SCOUTS — can now be re-seeded via admin-only entrypoints.
+#   registration.admin_seed_player() and registration.admin_seed_scout() are
+#   admin-authenticated and accept the full exported payload needed to recreate
+#   the persistent profile state without requiring the player's or scout's own
+#   signature. This script exports the data to JSON and then replays it onto the
+#   NEW contract using the admin key.
 #
 #   LEVELS — the registration contract does NOT store player level; the progress
 #   contract is the source of truth (see resolve_level / set_player_level). The
@@ -233,10 +227,10 @@ fi
 echo "    Validators exported to $VALIDATORS_EXPORT"
 
 # ===========================================================================
-# PART 2 — PLAYERS  (EXPORT ONLY — cannot be auto-replayed, see header)
+# PART 2 — PLAYERS  (EXPORT + RE-SEED)
 # ===========================================================================
 echo ""
-echo "==> [2/3] Exporting players (registration contract)..."
+echo "==> [2/3] Exporting and replaying players (registration contract)..."
 PLAYER_COUNT_RAW="$(invoke_view "$OLD_REGISTRATION_CONTRACT_ID" get_player_count 2>/dev/null || echo 0)"
 PLAYER_COUNT="$(echo "$PLAYER_COUNT_RAW" | tr -dc '0-9')"
 PLAYER_COUNT="${PLAYER_COUNT:-0}"
@@ -256,19 +250,57 @@ if [[ "$PLAYER_COUNT" -gt 0 ]]; then
       echo "    (player_id $id not found — likely deregistered; skipping)"
       continue
     fi
-    # get_player returns the full PlayerProfile including wallet, vitals,
-    # ipfs_hashes and the level resolved from the progress contract.
     tmp="$(mktemp)"
     jq --argjson p "$player" '. += [$p]' "$PLAYERS_EXPORT" > "$tmp" && mv "$tmp" "$PLAYERS_EXPORT"
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      echo "    [dry-run] would admin_seed_player player_id=$id on $NEW_REGISTRATION_CONTRACT_ID"
+      continue
+    fi
+
+    wallet="$(echo "$player" | jq -r '.wallet // empty' 2>/dev/null || true)"
+    vitals="$(echo "$player" | jq -c '{age: (.vitals.age // 0), position: (.vitals.position // ""), region: (.vitals.region // ""), nationality: (.vitals.nationality // "")}' 2>/dev/null || true)"
+    ipfs_hashes="$(echo "$player" | jq -c '.ipfs_hashes // []' 2>/dev/null || true)"
+    level="$(echo "$player" | jq -r '.level // "Unverified"' 2>/dev/null || true)"
+    registered_at="$(echo "$player" | jq -r '.registered_at // 0' 2>/dev/null || true)"
+    updated_at="$(echo "$player" | jq -r '.updated_at // 0' 2>/dev/null || true)"
+
+    if [[ -z "$wallet" || -z "$vitals" || -z "$ipfs_hashes" ]]; then
+      echo "    WARN: incomplete player payload for id $id — skipping." >&2
+      continue
+    fi
+
+    echo "    Re-seeding player $id on new contract..."
+    set +e
+    out="$(stellar contract invoke \
+      --id "$NEW_REGISTRATION_CONTRACT_ID" \
+      --source "$DEPLOYER" \
+      --network "$NETWORK" \
+      -- admin_seed_player \
+      --wallet "$wallet" \
+      --vitals "$vitals" \
+      --ipfs_hashes "$ipfs_hashes" \
+      --level "$level" \
+      --player_id "$id" \
+      --registered_at "$registered_at" \
+      --updated_at "$updated_at" 2>&1)"
+    status=$?
+    set -e
+    if [[ $status -ne 0 ]]; then
+      echo "$out" >&2
+      echo "ERROR: admin_seed_player failed for player_id $id." >&2
+      exit 1
+    fi
+    echo "      OK"
   done
 fi
 echo "    Players exported to $PLAYERS_EXPORT"
 
 # ===========================================================================
-# PART 3 — SCOUTS  (EXPORT ONLY — same self-auth gap as players)
+# PART 3 — SCOUTS  (EXPORT + RE-SEED)
 # ===========================================================================
 echo ""
-echo "==> [3/3] Exporting scouts (registration contract)..."
+echo "==> [3/3] Exporting and replaying scouts (registration contract)..."
 SCOUT_COUNT_RAW="$(invoke_view "$OLD_REGISTRATION_CONTRACT_ID" get_scout_count 2>/dev/null || echo 0)"
 SCOUT_COUNT="$(echo "$SCOUT_COUNT_RAW" | tr -dc '0-9')"
 SCOUT_COUNT="${SCOUT_COUNT:-0}"
@@ -290,6 +322,42 @@ if [[ "$SCOUT_COUNT" -gt 0 ]]; then
     fi
     tmp="$(mktemp)"
     jq --argjson s "$scout" '. += [$s]' "$SCOUTS_EXPORT" > "$tmp" && mv "$tmp" "$SCOUTS_EXPORT"
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      echo "    [dry-run] would admin_seed_scout scout_id=$id on $NEW_REGISTRATION_CONTRACT_ID"
+      continue
+    fi
+
+    wallet="$(echo "$scout" | jq -r '.wallet // empty' 2>/dev/null || true)"
+    region="$(echo "$scout" | jq -r '.region // empty' 2>/dev/null || true)"
+    registered_at="$(echo "$scout" | jq -r '.registered_at // 0' 2>/dev/null || true)"
+    verified="$(echo "$scout" | jq -r '.verified // false' 2>/dev/null || true)"
+
+    if [[ -z "$wallet" || -z "$region" ]]; then
+      echo "    WARN: incomplete scout payload for id $id — skipping." >&2
+      continue
+    fi
+
+    echo "    Re-seeding scout $id on new contract..."
+    set +e
+    out="$(stellar contract invoke \
+      --id "$NEW_REGISTRATION_CONTRACT_ID" \
+      --source "$DEPLOYER" \
+      --network "$NETWORK" \
+      -- admin_seed_scout \
+      --wallet "$wallet" \
+      --region "$region" \
+      --scout_id "$id" \
+      --registered_at "$registered_at" \
+      --verified "$verified" 2>&1)"
+    status=$?
+    set -e
+    if [[ $status -ne 0 ]]; then
+      echo "$out" >&2
+      echo "ERROR: admin_seed_scout failed for scout_id $id." >&2
+      exit 1
+    fi
+    echo "      OK"
   done
 fi
 echo "    Scouts exported to $SCOUTS_EXPORT"
@@ -310,15 +378,11 @@ fi
 echo "  Players    : $PLAYER_COUNT exported to $PLAYERS_EXPORT"
 echo "  Scouts     : $SCOUT_COUNT exported to $SCOUTS_EXPORT"
 echo ""
-echo "  ACTION REQUIRED — players and scouts were NOT re-seeded on the new"
-echo "  contract. register_player() / register_scout() require the player's /"
-echo "  scout's OWN signature (wallet.require_auth()), which an operator does"
-echo "  not hold. Close this gap by EITHER:"
-echo "    (a) having each player / scout re-register against the new contract"
-echo "        ID (self-service), OR"
-echo "    (b) adding an admin-only seeding entrypoint to the registration"
-echo "        contract (follow-up work, out of scope for this tool)."
+echo "  Players and scouts were re-seeded on the new contract via"
+echo "  admin-only registration entrypoints (admin_seed_player /"
+echo "  admin_seed_scout)."
 echo ""
-echo "  The exported JSON files above contain every field needed to drive"
-echo "  either path (wallet, vitals, ipfs_hashes, level, region)."
+echo "  The exported JSON files above contain the full replay payloads"
+echo "  (wallet, vitals, ipfs_hashes, level, region) for auditing and"
+echo "  future reconciliation."
 echo "=========================================================================="
