@@ -5,8 +5,8 @@ mod types;
 
 use errors::ScoutChainError;
 use types::{
-    ContractHealth, DataKey, FilterResult, PlayerProfile, PlayerSummary, ProgressLevel,
-    ScoutProfile, StoredPlayerProfile,
+    ContractHealth, DataKey, FilterResult, PlayerProfile, PlayerStatus, PlayerSummary,
+    ProgressLevel, ScoutProfile, StoredPlayerProfile,
 };
 // `PlayerVitals` is an *input* type of the public `register_player` function, so
 // it must be nameable by external callers (integration tests, generated
@@ -211,6 +211,14 @@ impl RegistrationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Player(player_id), &stored);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlayerLevel(player_id), &level);
+        env.storage().persistent().extend_ttl(
+            &DataKey::PlayerLevel(player_id),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
         events::player_level_synced(&env, player_id, &progress_contract);
         Ok(())
     }
@@ -281,6 +289,14 @@ impl RegistrationContract {
         env.storage()
             .persistent()
             .set(&DataKey::PlayerByWallet(wallet.clone()), &player_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlayerLevel(player_id), &ProgressLevel::Unverified);
+        env.storage().persistent().extend_ttl(
+            &DataKey::PlayerLevel(player_id),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
 
         // Add to player index
         let mut player_ids: Vec<u64> = env
@@ -339,6 +355,7 @@ impl RegistrationContract {
         env.storage()
             .persistent()
             .remove(&DataKey::PlayerByWallet(profile.wallet));
+        env.storage().persistent().remove(&DataKey::PlayerLevel(player_id));
 
         // Remove from player index
         let mut player_ids: Vec<u64> = env
@@ -442,6 +459,110 @@ impl RegistrationContract {
         Ok(scout_id)
     }
 
+    /// Seed a player profile directly using admin authority.
+    pub fn admin_seed_player(
+        env: Env,
+        wallet: Address,
+        vitals: PlayerVitals,
+        ipfs_hashes: Vec<String>,
+        level: ProgressLevel,
+        player_id: u64,
+        registered_at: u64,
+        updated_at: u64,
+    ) -> Result<u64, ScoutChainError> {
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        Self::require_initialized(&env)?;
+        Self::require_not_paused(&env)?;
+
+        if vitals.age == 0 || vitals.age < MIN_PLAYER_AGE {
+            return Err(ScoutChainError::InvalidInput);
+        }
+        if vitals.position.len() > MAX_STRING_LEN
+            || vitals.region.len() > MAX_REGION_LEN
+            || vitals.nationality.len() > MAX_STRING_LEN
+        {
+            return Err(ScoutChainError::InvalidInput);
+        }
+        if vitals.age > MAX_PLAYER_AGE {
+            return Err(ScoutChainError::InvalidInput);
+        }
+        if ipfs_hashes.is_empty() || ipfs_hashes.len() > MAX_IPFS_HASHES {
+            return Err(ScoutChainError::InvalidInput);
+        }
+
+        let stored = StoredPlayerProfile {
+            player_id,
+            wallet: wallet.clone(),
+            vitals,
+            ipfs_hashes,
+            registered_at,
+            updated_at,
+        };
+
+        env.storage().persistent().set(&DataKey::Player(player_id), &stored);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlayerByWallet(wallet.clone()), &player_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlayerLevel(player_id), &level);
+        env.storage().persistent().extend_ttl(
+            &DataKey::PlayerLevel(player_id),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+
+        let mut player_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlayerIndex)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !player_ids.iter().any(|id| id == player_id) {
+            player_ids.push_back(player_id);
+            env.storage().persistent().set(&DataKey::PlayerIndex, &player_ids);
+        }
+
+        Self::composite_index_add(&env, &level, &stored.vitals.region, player_id);
+        Self::level_index_add(&env, &level, player_id);
+
+        events::player_registered(&env, player_id, &wallet);
+        Ok(player_id)
+    }
+
+    /// Seed a scout profile directly using admin authority.
+    pub fn admin_seed_scout(
+        env: Env,
+        wallet: Address,
+        region: String,
+        scout_id: u64,
+        registered_at: u64,
+        verified: bool,
+    ) -> Result<u64, ScoutChainError> {
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        Self::require_initialized(&env)?;
+        Self::require_not_paused(&env)?;
+
+        if region.len() > MAX_REGION_LEN {
+            return Err(ScoutChainError::InvalidInput);
+        }
+
+        let profile = ScoutProfile {
+            scout_id,
+            wallet: wallet.clone(),
+            region,
+            verified,
+            registered_at,
+        };
+
+        env.storage().persistent().set(&DataKey::Scout(scout_id), &profile);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ScoutByWallet(wallet.clone()), &scout_id);
+
+        events::scout_registered(&env, scout_id, &wallet);
+        Ok(scout_id)
+    }
+
     // -------------------------------------------------------------------------
     // Queries
     // -------------------------------------------------------------------------
@@ -484,6 +605,20 @@ impl RegistrationContract {
             .get(&DataKey::PlayerByWallet(wallet))
             .ok_or(ScoutChainError::PlayerNotFound)?;
         Self::load_player(&env, player_id)
+    }
+
+    pub fn get_player_status(env: Env, player_id: u64) -> Result<PlayerStatus, ScoutChainError> {
+        Self::load_stored_player(&env, player_id)?;
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::PlayerDeactivated(player_id))
+            .unwrap_or(false)
+        {
+            Ok(PlayerStatus::Deactivated)
+        } else {
+            Ok(PlayerStatus::Active)
+        }
     }
 
     pub fn get_scout(env: Env, scout_id: u64) -> Result<ScoutProfile, ScoutChainError> {
@@ -743,6 +878,14 @@ impl RegistrationContract {
     /// Falls back to `Unverified` when no progress contract is configured
     /// (e.g. during tests or before deployment wiring).
     fn resolve_level(env: &Env, player_id: u64) -> ProgressLevel {
+        if let Some(level) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ProgressLevel>(&DataKey::PlayerLevel(player_id))
+        {
+            return level;
+        }
+
         if let Some(progress_addr) = env
             .storage()
             .instance()
@@ -2030,6 +2173,58 @@ mod tests {
             result_reactivated.profiles.get(0).unwrap().player_id,
             player_id
         );
+    }
+
+    #[test]
+    fn test_admin_seed_player_persists_profile_and_status() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let vitals = PlayerVitals {
+            age: 20,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "West Africa"),
+            nationality: String::from_str(&env, "Ghana"),
+        };
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+        let player_id = client.admin_seed_player(
+            &wallet,
+            &vitals,
+            &hashes,
+            &ProgressLevel::PerformanceMilestones,
+            &7u64,
+            &100u64,
+            &200u64,
+        );
+
+        assert_eq!(player_id, 7u64);
+        let profile = client.get_player(&7u64);
+        assert_eq!(profile.wallet, wallet);
+        assert_eq!(profile.level, ProgressLevel::PerformanceMilestones);
+        assert_eq!(client.get_player_status(&7u64), types::PlayerStatus::Active);
+    }
+
+    #[test]
+    fn test_admin_seed_scout_persists_profile() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let scout_id = client.admin_seed_scout(
+            &wallet,
+            &String::from_str(&env, "Europe"),
+            &11u64,
+            &123u64,
+            &true,
+        );
+
+        assert_eq!(scout_id, 11u64);
+        let scout = client.get_scout(&11u64);
+        assert_eq!(scout.wallet, wallet);
+        assert!(scout.verified);
     }
 
     // -------------------------------------------------------------------------

@@ -62,6 +62,14 @@ pub struct FilterResult {
     pub next_cursor: u64,
 }
 
+/// Direct status for a registered player.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlayerStatus {
+    Active,
+    Deactivated,
+}
+
 /// Scout profile stored on-chain
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -101,6 +109,10 @@ pub enum DataKey {
     PlayerIndex,
     /// Address of the progress contract allowed to call set_player_level
     ProgressContract,
+    /// Explicit player level override used for admin-seeded players or
+    /// progress updates that should be visible to reads even before a progress
+    /// contract is wired.
+    PlayerLevel(u64),
     /// Composite index: (ProgressLevel, region) → Vec<u64> of player IDs.
     /// Used by `filter_players` for combined level+region queries so only
     /// matching players are loaded, avoiding a full scan of `PlayerIndex`.
