@@ -291,12 +291,14 @@ impl ScoutAccessContract {
                 if Self::tier_rank(&tier) < Self::tier_rank(&existing.tier) {
                     return Err(ScoutAccessError::SubscriptionDowngradeNotAllowed);
                 }
-                let min_next = existing
-                    .subscribed_at
-                    .checked_add(MIN_UPGRADE_INTERVAL_SECS)
-                    .ok_or(ScoutAccessError::Overflow)?;
-                if now < min_next {
-                    return Err(ScoutAccessError::UpgradeTooSoon);
+                if Self::tier_rank(&tier) > Self::tier_rank(&existing.tier) {
+                    let min_next = existing
+                        .subscribed_at
+                        .checked_add(MIN_UPGRADE_INTERVAL_SECS)
+                        .ok_or(ScoutAccessError::Overflow)?;
+                    if now < min_next {
+                        return Err(ScoutAccessError::UpgradeTooSoon);
+                    }
                 }
             }
         }
@@ -2783,16 +2785,16 @@ mod tests {
     }
 
     #[test]
-    fn test_rapid_same_tier_renewal_rejected() {
+    fn test_rapid_same_tier_renewal_succeeds() {
         let (env, admin, xlm, _contract_id, client) = setup();
         let scout = Address::generate(&env);
         mint_token(&env, &xlm, &admin, &scout, 100_000_000);
 
         client.subscribe(&scout, &SubscriptionTier::Pro);
 
-        // Attempt same-tier renewal immediately — should be rejected
+        // Same-tier renewals should not be blocked by the upgrade timing guard.
         let result = client.try_subscribe(&scout, &SubscriptionTier::Pro);
-        assert_eq!(result, Err(Ok(ScoutAccessError::UpgradeTooSoon)));
+        assert!(result.is_ok());
     }
 
     #[test]
