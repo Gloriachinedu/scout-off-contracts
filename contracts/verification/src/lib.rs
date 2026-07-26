@@ -904,7 +904,7 @@ impl VerificationContract {
         Ok(milestone)
     }
 
-    pub fn get_milestone_with_validator_status(
+    pub fn get_milestone_with_status(
         env: Env,
         player_id: u64,
         index: u32,
@@ -1052,17 +1052,40 @@ impl VerificationContract {
         page
     }
 
+    /// Return full milestone records for a validator across all players, page by page.
+    pub fn get_milestones_by_validator_page(
+        env: Env,
+        wallet: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Milestone> {
+        let refs: Vec<MilestoneRef> = Self::get_validator_milestones_page(env.clone(), wallet, offset, limit);
+        let mut milestones = Vec::new(&env);
+        for i in 0..refs.len() {
+            let ref_entry = refs.get(i).unwrap();
+            if let Ok(milestone) = Self::get_milestone(env.clone(), ref_entry.player_id, ref_entry.milestone_index) {
+                milestones.push_back(milestone);
+            }
+        }
+        milestones
+    }
+
     /// Returns the detailed status of a validator wallet.
     pub fn get_validator_status(env: Env, wallet: Address) -> ValidatorStatus {
+        let wallet_key = wallet.clone();
         match env
             .storage()
             .persistent()
-            .get::<DataKey, Validator>(&DataKey::Validator(wallet))
+            .get::<DataKey, Validator>(&DataKey::Validator(wallet_key.clone()))
         {
             None => ValidatorStatus::NotRegistered,
             Some(v) if v.active => ValidatorStatus::Active,
             Some(_) => {
-                if env.storage().persistent().has(&DataKey::ValidatorRevokedForCause(wallet)) {
+                if env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::ValidatorRevokedForCause(wallet_key))
+                {
                     ValidatorStatus::RevokedForCause
                 } else {
                     ValidatorStatus::Revoked
@@ -1391,7 +1414,7 @@ mod tests {
             invoke: &MockAuthInvoke {
                 contract: &client.address,
                 fn_name: "accept_admin",
-                args: vec![&env],
+                args: soroban_sdk::vec![&env],
                 sub_invokes: &[],
             },
         }]);
@@ -1405,7 +1428,7 @@ mod tests {
             invoke: &MockAuthInvoke {
                 contract: &client.address,
                 fn_name: "pause_contract",
-                args: vec![&env],
+                args: soroban_sdk::vec![&env],
                 sub_invokes: &[],
             },
         }]);
@@ -1488,6 +1511,36 @@ mod tests {
             assert_eq!(actual.player_id, expected.player_id);
             assert_eq!(actual.milestone_index, expected.milestone_index);
         }
+    }
+
+    #[test]
+    fn test_get_milestones_by_validator_page_returns_full_records() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let validator = Address::generate(&env);
+        client.register_validator(&validator, &String::from_str(&env, "Academy Director"));
+
+        client.approve_milestone(
+            &validator,
+            &1u64,
+            &String::from_str(&env, "approved"),
+            &String::from_str(&env, VALID_CID_V0),
+        );
+        client.approve_milestone(
+            &validator,
+            &2u64,
+            &String::from_str(&env, "second"),
+            &String::from_str(&env, VALID_CID_V0_2),
+        );
+
+        let page = client.get_milestones_by_validator_page(&validator, &0, &5);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap().player_id, 1u64);
+        assert_eq!(page.get(0).unwrap().description, String::from_str(&env, "approved"));
+        assert_eq!(page.get(1).unwrap().player_id, 2u64);
+        assert_eq!(page.get(1).unwrap().evidence_hash, String::from_str(&env, VALID_CID_V0_2));
     }
 
     // -------------------------------------------------------------------------
@@ -2978,16 +3031,16 @@ mod tests {
         assert_eq!(client.get_validator_status(&wallet_routine), types::ValidatorStatus::Revoked);
 
         // Check milestone with status
-        let milestone_cause = client.get_milestone_with_validator_status(&1u64, &1u32);
+        let milestone_cause = client.get_milestone_with_status(&1u64, &1u32);
         assert_eq!(milestone_cause.validator_status, types::ValidatorStatus::RevokedForCause);
 
-        let milestone_routine = client.get_milestone_with_validator_status(&2u64, &1u32);
+        let milestone_routine = client.get_milestone_with_status(&2u64, &1u32);
         assert_eq!(milestone_routine.validator_status, types::ValidatorStatus::Revoked);
         
         // Restore validator and verify the flag is cleared
         client.restore_validator(&wallet_cause);
         assert_eq!(client.get_validator_status(&wallet_cause), types::ValidatorStatus::Active);
-        let milestone_restored = client.get_milestone_with_validator_status(&1u64, &1u32);
+        let milestone_restored = client.get_milestone_with_status(&1u64, &1u32);
         assert_eq!(milestone_restored.validator_status, types::ValidatorStatus::Active);
     }
 }
